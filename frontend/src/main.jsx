@@ -19,6 +19,7 @@ import axios from 'axios';
 import { API_BASE_URL } from './apiConfig';
 import { ToastContainer, toast } from 'react-toastify';
 import 'react-toastify/dist/ReactToastify.css';
+import CheckoutSuccess from './CheckoutSuccess.jsx';
 
 axios.defaults.withCredentials = true;
 axios.defaults.baseURL = API_BASE_URL;
@@ -129,6 +130,7 @@ createRoot(document.getElementById('root')).render(
             <Route path="/MainPage" element={<MainPage />} />
             <Route path="/add-product" element={<AddProductPage />} />
             <Route path="/cart" element={<CartPage />} />
+            <Route path="/checkout/success" element={<CheckoutSuccess />} />
             <Route path="/OrderHistory" element={<OrderHistory />} />
             <Route path="/MyProduct" element={<MyProduct />} />
             <Route path="/Analytics" element={<Analytics />} />

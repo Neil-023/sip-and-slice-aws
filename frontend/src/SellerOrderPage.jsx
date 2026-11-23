@@ -7,6 +7,7 @@ import './components/OrderHistoryCard.css';
 import './components/OrderHistoryItem.css';
 import { mockData } from './mockData';
 import axios from 'axios';
+import { toast } from 'react-toastify';
 import { preloadImagesWithProgress } from './imagePreload';
 
 const USE_MOCK_FALLBACK = import.meta.env.VITE_USE_MOCK_FALLBACK === 'true';
@@ -27,6 +28,7 @@ function SellerOrderPage() {
   const [orders, setOrders] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [preloadProgress, setPreloadProgress] = useState(0);
+  const [refundingId, setRefundingId] = useState(null);
 
   useEffect(() => {
     const loadOrders = async () => {
@@ -125,6 +127,30 @@ function SellerOrderPage() {
     }
   };
 
+  const handleRefund = async (orderId) => {
+    if (!window.confirm(`Refund Order #${orderId}? This cannot be undone.`)) {
+      return;
+    }
+
+    setRefundingId(orderId);
+    try {
+      await axios.post(`/api/admin/orders/${orderId}/refund`);
+      toast.success(`Refund initiated for Order #${orderId}`);
+      setOrders((prev) =>
+        prev.map((order) =>
+          order.order_id === orderId
+            ? { ...order, status: 'refunded' }
+            : order
+        )
+      );
+    } catch (error) {
+      console.error('Failed to refund order', error);
+      toast.error(error?.response?.data?.detail ?? 'Failed to process refund.');
+    } finally {
+      setRefundingId(null);
+    }
+  };
+
   return (
     <div>
       <Navbar />
@@ -148,6 +174,8 @@ function SellerOrderPage() {
                 status={order.status}
                 items={order.items}
                 onStatusChange={handleStatusChange}
+                onRefund={handleRefund}
+                isRefunding={refundingId === order.order_id}
               />
             </div>
           ))}

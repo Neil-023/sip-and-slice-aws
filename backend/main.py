@@ -4,11 +4,15 @@ from datetime import datetime, timedelta, timezone
 from itertools import combinations
 from typing import List, Optional
 from mangum import Mangum
+import json
 
 import cloudinary
 import cloudinary.uploader
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
+import logging
+import stripe
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, status
+from sqlalchemy.exc import IntegrityError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
@@ -68,6 +72,16 @@ if CLOUDINARY_URL:
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
+logger = logging.getLogger("stripe_payments")
+
+stripe.api_key = get_required_env("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = get_required_env("STRIPE_WEBHOOK_SECRET")
+FRONTEND_URL = get_required_env("FRONTEND_URL").rstrip("/")
+
+
+def send_order_confirmation_task(order_id: int, buyer_email: str, status_label: str):
+    """Runs in the background so Stripe webhooks return 200 OK immediately."""
+    logger.info(f"[BackgroundTask] Order #{order_id} ({status_label}) notification queued for {buyer_email}")
 
 def get_db():
     db = SessionLocal()
@@ -761,6 +775,292 @@ def create_order(
         "ordered_at": order.ordered_at,
     }
 
+@app.post("/api/checkout/create-session")
+def create_stripe_checkout_session(
+    current_user: models.User = Depends(get_current_user),
+    _allowed_user: models.User = Depends(require_non_demo_user),
+    db: Session = Depends(get_db),
+):
+    cart = get_or_create_user_cart(current_user.user_id, db)
+    cart_items = db.query(models.CartItem).filter(models.CartItem.cart_id == cart.cart_id).all()
+    if not cart_items:
+        raise HTTPException(status_code=400, detail="Your cart is empty")
+
+    total_centavos = 0
+    product_rows = []
+    line_items = []
+
+    for item in cart_items:
+        product = db.query(models.Product).filter(
+            models.Product.product_id == item.product_id,
+            models.Product.deleted_at.is_(None),
+        ).first()
+        if not product:
+            raise HTTPException(status_code=404, detail=f"Product {item.product_id} not found")
+        if product.avail_stocks < item.quantity:
+            raise HTTPException(status_code=400, detail=f"Insufficient stock for {product.product_name}")
+
+        unit_centavos = int(round(product.price * 100))
+        total_centavos += unit_centavos * item.quantity
+        product_rows.append((product, item.quantity))
+
+        line_items.append({
+            "price_data": {
+                "currency": "php",
+                "product_data": {
+                    "name": product.product_name,
+                    "images": [product.product_img] if product.product_img and product.product_img.startswith("http") else [],
+                },
+                "unit_amount": unit_centavos,
+            },
+            "quantity": item.quantity,
+        })
+
+    if total_centavos < 3000:
+        raise HTTPException(status_code=400, detail="Minimum checkout amount is ₱30.00")
+
+    order = models.Order(
+        buyer_id=current_user.user_id,
+        status="pending_payment",
+        total_price=total_centavos / 100.0,
+    )
+    db.add(order)
+    db.flush()
+
+    for product, quantity in product_rows:
+        db.add(models.OrderItem(
+            order_id=order.order_id,
+            product_id=product.product_id,
+            quantity=quantity,
+            price_each=product.price,
+        ))
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",                 
+            line_items=line_items,
+            customer_email=current_user.email_address,
+            metadata={
+                "order_id": str(order.order_id),
+                "user_id": str(current_user.user_id),
+            },
+            success_url=f"{FRONTEND_URL}/checkout/success?order_id={order.order_id}",
+            cancel_url=f"{FRONTEND_URL}/cart?canceled=true",
+            idempotency_key=f"checkout_order_{order.order_id}",
+        )
+    except stripe.error.CardError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=e.user_message or "Card was declined.")
+    except (stripe.error.RateLimitError, stripe.error.APIConnectionError):
+        db.rollback()
+        raise HTTPException(status_code=503, detail="Payment gateway temporarily unavailable. Please retry.")
+    except stripe.error.StripeError:
+        db.rollback()
+        raise HTTPException(status_code=502, detail="Unable to initialize payment session.")
+
+    order.stripe_session_id = session.id
+    db.commit()
+
+    return {"checkout_url": session.url, "order_id": order.order_id}
+
+
+@app.post("/api/webhooks/stripe")
+async def stripe_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except (ValueError, stripe.error.SignatureVerificationError):
+        raise HTTPException(status_code=400, detail="Invalid Stripe webhook signature")
+
+    event_dict = json.loads(payload)
+    event_id = event_dict["id"]
+    event_type = event_dict["type"]
+    data_obj = event_dict["data"]["object"]
+
+    # Inbound Idempotency: record event ID atomically
+    try:
+        db.add(models.WebhookEvent(stripe_event_id=event_id, event_type=event_type))
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        return {"received": True, "duplicate": True}
+
+    if event_type == "checkout.session.completed":
+        order_id = data_obj.get("metadata", {}).get("order_id")
+        if order_id:
+            order = db.query(models.Order).filter(models.Order.order_id == int(order_id)).with_for_update().first()
+            if order and order.status == "pending_payment":
+                # Zero-Trust Amount Verification
+                expected_centavos = int(round(order.total_price * 100))
+                paid_centavos = data_obj.get("amount_total")
+                if paid_centavos != expected_centavos:
+                    logger.error(f"Amount mismatch on Order #{order.order_id}: expected {expected_centavos}, got {paid_centavos}")
+                    order.status = "amount_mismatch"
+                    db.commit()
+                    return {"received": True}
+
+                payment_intent_id = data_obj.get("payment_intent")
+                order.stripe_payment_intent_id = payment_intent_id
+
+                # Concurrency Protection: lock product rows in sorted order
+                order_items = (
+                    db.query(models.OrderItem)
+                    .filter(models.OrderItem.order_id == order.order_id)
+                    .order_by(models.OrderItem.product_id.asc())
+                    .all()
+                )
+                locked_products = {}
+                insufficient = False
+                for item in order_items:
+                    product = (
+                        db.query(models.Product)
+                        .filter(models.Product.product_id == item.product_id)
+                        .with_for_update()
+                        .first()
+                    )
+                    if not product or product.avail_stocks < item.quantity:
+                        insufficient = True
+                        break
+                    locked_products[item.product_id] = product
+
+                if insufficient:
+                    order.status = "refunded_out_of_stock"
+                    db.commit()
+                    if payment_intent_id:
+                        stripe.Refund.create(
+                            payment_intent=payment_intent_id,
+                            idempotency_key=f"auto_refund_{order.order_id}",
+                        )
+                    return {"received": True}
+
+                for item in order_items:
+                    locked_products[item.product_id].avail_stocks -= item.quantity
+
+                order.status = "paid"
+                cart = db.query(models.Cart).filter(models.Cart.user_id == order.buyer_id).first()
+                if cart:
+                    db.query(models.CartItem).filter(models.CartItem.cart_id == cart.cart_id).delete()
+
+                buyer = db.query(models.User).filter(models.User.user_id == order.buyer_id).first()
+                db.commit()
+
+                if buyer:
+                    background_tasks.add_task(send_order_confirmation_task, order.order_id, buyer.email_address, "paid")
+                return {"received": True}
+
+    elif event_type == "checkout.session.expired":
+        order_id = data_obj.get("metadata", {}).get("order_id")
+        if order_id:
+            order = db.query(models.Order).filter(models.Order.order_id == int(order_id)).first()
+            if order and order.status == "pending_payment":
+                order.status = "expired"
+
+    elif event_type == "charge.refunded":
+        payment_intent_id = data_obj.get("payment_intent")
+        if payment_intent_id:
+            order = (
+                db.query(models.Order)
+                .filter(models.Order.stripe_payment_intent_id == payment_intent_id)
+                .with_for_update()
+                .first()
+            )
+            if order and order.status in {"paid", "delivered", "completed"}:
+                order_items = db.query(models.OrderItem).filter(models.OrderItem.order_id == order.order_id).all()
+                for item in order_items:
+                    product = db.query(models.Product).filter(models.Product.product_id == item.product_id).with_for_update().first()
+                    if product:
+                        product.avail_stocks += item.quantity
+                order.status = "refunded"
+
+    db.commit()
+    return {"received": True}
+
+@app.post("/api/admin/orders/{order_id}/refund")
+def refund_order(
+    order_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    if current_user.role not in ("admin", "seller"):
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    order = db.query(models.Order).filter(models.Order.order_id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found.")
+
+    if order.status != "paid":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only paid orders can be refunded (current status: {order.status}).",
+        )
+
+    if not order.stripe_payment_intent_id:
+        raise HTTPException(
+            status_code=400,
+            detail="No Stripe payment intent found for this order.",
+        )
+
+    try:
+        refund = stripe.Refund.create(
+            payment_intent=order.stripe_payment_intent_id,
+            idempotency_key=f"refund_order_{order.order_id}",
+        )
+        return {
+            "message": "Refund initiated successfully.",
+            "refund_id": refund.id,
+            "order_id": order.order_id,
+        }
+    except stripe.error.StripeError:
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to process refund with Stripe.",
+        )
+
+
+@app.get("/api/orders/{order_id}/status")
+def get_order_status(
+    order_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    order = db.query(models.Order).filter(
+        models.Order.order_id == order_id,
+        models.Order.buyer_id == current_user.user_id,
+    ).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return {"order_id": order.order_id, "status": order.status, "total_price": order.total_price}
+
+
+@app.post("/api/admin/orders/{order_id}/refund")
+def refund_admin_order(
+    order_id: int,
+    _admin: models.User = Depends(require_admin),
+    _allowed_user: models.User = Depends(require_non_demo_user),
+    db: Session = Depends(get_db),
+):
+    order = db.query(models.Order).filter(models.Order.order_id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if not order.stripe_payment_intent_id:
+        raise HTTPException(status_code=400, detail="Order has no Stripe payment to refund")
+    if order.status in {"refunded", "refunded_out_of_stock"}:
+        raise HTTPException(status_code=400, detail="Order is already refunded")
+
+    try:
+        refund = stripe.Refund.create(
+            payment_intent=order.stripe_payment_intent_id,
+            idempotency_key=f"admin_refund_{order.order_id}",
+        )
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=502, detail=f"Refund failed: {e.user_message or 'Gateway error'}")
+
+    return {"order_id": order.order_id, "refund_id": refund.id, "status": "refund_initiated"}
 
 @app.get("/api/orders")
 def list_my_orders(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -846,7 +1146,16 @@ def update_admin_order_status(
     _allowed_user: models.User = Depends(require_non_demo_user),
     db: Session = Depends(get_db),
 ):
-    valid = {"pending", "delivered", "completed"}
+    valid = {
+    "pending_payment",
+    "pending",
+    "paid",
+    "delivered",
+    "completed",
+    "expired",
+    "refunded",
+    "refunded_out_of_stock",
+}
     if payload.status not in valid:
         raise HTTPException(status_code=400, detail="Invalid status")
 
@@ -864,7 +1173,13 @@ def update_admin_order_status(
 
 @app.get("/api/admin/analytics")
 def get_admin_analytics(_admin: models.User = Depends(require_admin), db: Session = Depends(get_db)):
-    orders = db.query(models.Order).order_by(models.Order.ordered_at.desc()).all()
+    valid_revenue_statuses = {"paid", "delivered", "completed", "pending"}
+    orders = (
+        db.query(models.Order)
+        .filter(models.Order.status.in_(valid_revenue_statuses))
+        .order_by(models.Order.ordered_at.desc())
+        .all()
+    )
     order_items = db.query(models.OrderItem).all()
     products = db.query(models.Product).all()
     categories = db.query(models.Category).all()

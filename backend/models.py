@@ -52,8 +52,10 @@ class Order(Base):
     __tablename__ = "orders"
     order_id = Column(Integer, primary_key=True, index=True)
     buyer_id = Column(Integer, ForeignKey("users.user_id"))
-    status = Column(String, default="pending") 
+    status = Column(String, default="pending_payment")
     total_price = Column(Float)
+    stripe_session_id = Column(String, unique=True, nullable=True, index=True)
+    stripe_payment_intent_id = Column(String, nullable=True, index=True)
     ordered_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -64,3 +66,10 @@ class OrderItem(Base):
     product_id = Column(Integer, ForeignKey("products.product_id"))
     quantity = Column(Integer)
     price_each = Column(Float)
+    
+class WebhookEvent(Base):
+    __tablename__ = "webhook_events"
+    id = Column(Integer, primary_key=True, index=True)
+    stripe_event_id = Column(String, unique=True, nullable=False, index=True)
+    event_type = Column(String, nullable=False)
+    processed_at = Column(DateTime(timezone=True), server_default=func.now())

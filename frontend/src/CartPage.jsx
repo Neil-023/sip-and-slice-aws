@@ -1,4 +1,6 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
+import { toast } from 'react-toastify'
 import { useNavigate } from 'react-router-dom';
 import './CartPage.css';
 import { useCart } from './CartContext';
@@ -18,12 +20,21 @@ const resolveImage = (imageUrl) => {
 };
 
 function CartPage() {
-  const { cartBySeller, loadCart, updateQuantity, clearCart } = useCart();
-  const navigate = useNavigate();
+  const { cartBySeller, loadCart, updateQuantity } = useCart();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [isCheckingOut, setIsCheckingOut] = useState(false);
 
   useEffect(() => {
     loadCart();
   }, [loadCart]);
+
+  // Show a toast if the user clicked "Back" on Stripe Checkout
+  useEffect(() => {
+    if (searchParams.get('canceled') === 'true') {
+      toast.info('Checkout canceled — your cart items are still saved.');
+      setSearchParams({}, { replace: true });
+    }
+  }, [searchParams, setSearchParams]);
 
   const allItems = cartBySeller.flatMap((seller) => seller.items);
   const grandTotal = allItems.reduce(
@@ -33,18 +44,18 @@ function CartPage() {
 
   const handleCheckout = async () => {
     if (allItems.length === 0) {
-      alert('Your cart is empty.');
+      toast.warn('Your cart is empty.');
       return;
     }
 
+    setIsCheckingOut(true);
     try {
-      await axios.post('/api/orders', {});
-      await clearCart();
-      alert('Checkout successful!');
-      navigate('/OrderHistory');
+      const response = await axios.post('/api/checkout/create-session');
+      window.location.href = response.data.checkout_url;
     } catch (error) {
       console.error('Checkout failed', error);
-      alert(error?.response?.data?.detail ?? 'Checkout failed. Please try again.');
+      toast.error(error?.response?.data?.detail ?? 'Checkout failed. Please try again.');
+      setIsCheckingOut(false);
     }
   };
 
@@ -139,10 +150,29 @@ function CartPage() {
         <h3 className="total-price">Total: ₱{grandTotal.toFixed(2)}</h3>
       </div>
 
+      <div
+        style={{
+          margin: '1rem auto',
+          maxWidth: '720px',
+          padding: '0.85rem 1.25rem',
+          background: '#fff8e6',
+          border: '1px solid #f0c36d',
+          borderRadius: '8px',
+          fontSize: '0.9rem',
+          color: '#5c3d00',
+        }}
+      >
+        <strong>Stripe Sandbox Test Mode:</strong> Use any future expiry (<code>12/28</code>) &amp; CVC <code>123</code>.
+        <br />
+        • <strong>Success:</strong> <code>4242 4242 4242 4242</code> &nbsp;|&nbsp;
+        • <strong>Declined:</strong> <code>4000 0000 0000 9995</code> &nbsp;|&nbsp;
+        • <strong>3D Secure:</strong> <code>4000 0000 0000 3220</code>
+      </div>
+
       <div className="checkout-bar">
         <p className="checkout-bar-total">Total: ₱{grandTotal.toFixed(2)}</p>
-        <button className="checkout-btn" onClick={handleCheckout}>
-          Proceed to Checkout
+        <button className="checkout-btn" onClick={handleCheckout} disabled={isCheckingOut}>
+          {isCheckingOut ? 'Redirecting to Stripe...' : 'Proceed to Checkout'}
         </button>
       </div>
     </div>
